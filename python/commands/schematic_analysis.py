@@ -407,9 +407,11 @@ def _compute_symbol_bbox_direct(
             for lx, ly in graphics_points
         ]
 
-        # Union with pin positions so pins extending beyond body are included
-        all_xs = [p[0] for p in abs_points] + [p[0] for p in pin_positions.values()]
-        all_ys = [p[1] for p in abs_points] + [p[1] for p in pin_positions.values()]
+        # Use only body graphics for the bbox — pin endpoints are connection
+        # points where other components are intentionally placed, so including
+        # them causes false positives (e.g. decoupling caps at IC power pins).
+        all_xs = [p[0] for p in abs_points]
+        all_ys = [p[1] for p in abs_points]
 
         min_x, min_y = min(all_xs), min(all_ys)
         max_x, max_y = max(all_xs), max(all_ys)
@@ -754,7 +756,7 @@ def _compute_pin_positions_direct(
         if rotation != 0:
             rel_x, rel_y = PinLocator.rotate_point(rel_x, rel_y, rotation)
 
-        result[pin_num] = [sym_x + rel_x, sym_y + rel_y]
+        result[pin_num] = [round(sym_x + rel_x, 6), round(sym_y + rel_y, 6)]
     return result
 
 
