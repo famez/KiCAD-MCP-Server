@@ -1843,6 +1843,14 @@ class ComponentCommands(PlacementOptimizerCommands):
         the current placement or against a hypothetical placement
         (``positions``) that hasn't been committed to the board yet.
 
+        Footprint-to-footprint overlap is decided by real polygon collision
+        (``SHAPE_POLY_SET.Collide``), matching KiCad's own courtyard-overlap
+        model exactly — not an axis-aligned bounding-box approximation, which
+        false-positives on any courtyard with cut or chamfered corners (common
+        on QFP/QFN footprints) whenever another part sits in that empty notch.
+        The board-edge boundary check still uses each courtyard's bounding box,
+        since board outlines are themselves usually simple rectangles.
+
         Args:
             positions: Optional dict ``{ref: [x, y]}`` or ``{ref: [x, y, rot]}``
                 in mm/degrees. Virtual placements: the listed refs are
@@ -1894,8 +1902,11 @@ class ComponentCommands(PlacementOptimizerCommands):
             # Resolve board outline once.
             outline_bbox = self._resolve_outline_bbox(params.get("board_outline"))
 
-            # Gather courtyard bboxes for every footprint we'll consider.
+            # Gather courtyard bboxes (for the board-edge check) and real courtyard
+            # polygons (for footprint-to-footprint overlap) for every footprint we'll
+            # consider.
             entries = []
+            polygons = {}
             for fp in self.board.GetFootprints():
                 ref = fp.GetReference()
                 if ref_filter is not None and ref not in ref_filter:
@@ -1903,42 +1914,76 @@ class ComponentCommands(PlacementOptimizerCommands):
                 bbox = self._footprint_courtyard_bbox(fp, virtual.get(ref))
                 if bbox is None:
                     continue
-                # Expand by margin
+                # Expand by margin (board-edge check only)
                 if margin_mm:
                     x1, y1, x2, y2 = bbox
                     bbox = (x1 - margin_mm, y1 - margin_mm, x2 + margin_mm, y2 + margin_mm)
                 entries.append((ref, bbox))
+                poly = self._footprint_courtyard_polygon(fp, virtual.get(ref))
+                if poly is not None:
+                    polygons[ref] = poly
 
-            # Pairwise overlap (AABB intersect — matches KiCad DRC's
-            # courtyard-overlap detection model).
+            # Pairwise overlap — exact courtyard polygon collision (matches KiCad's
+            # own courtyards_overlap DRC check). A plain AABB-vs-AABB test used to
+            # be used here, but it false-positives whenever a courtyard has cut or
+            # chamfered corners (e.g. many QFP footprints): two AABBs can intersect
+            # in a corner that the real, notched polygon doesn't actually occupy.
             overlaps = []
-            entries_sorted = sorted(entries, key=lambda e: e[0])
-            for i in range(len(entries_sorted)):
-                a_ref, a = entries_sorted[i]
-                for j in range(i + 1, len(entries_sorted)):
-                    b_ref, b = entries_sorted[j]
-                    if a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]:
-                        ox = min(a[2], b[2]) - max(a[0], b[0])
-                        oy = min(a[3], b[3]) - max(a[1], b[1])
-                        overlaps.append(
-                            {
-                                "a": a_ref,
-                                "b": b_ref,
-                                "overlap_x_mm": round(ox, 3),
-                                "overlap_y_mm": round(oy, 3),
-                                "overlap_area_mm2": round(ox * oy, 4),
-                                "bbox": {
-                                    "x1": round(max(a[0], b[0]), 3),
-                                    "y1": round(max(a[1], b[1]), 3),
-                                    "x2": round(min(a[2], b[2]), 3),
-                                    "y2": round(min(a[3], b[3]), 3),
-                                    "unit": "mm",
-                                },
-                            }
+            margin_nm = int(round(margin_mm * 1_000_000.0))
+            refs_sorted = sorted(polygons.keys())
+            for i in range(len(refs_sorted)):
+                a_ref = refs_sorted[i]
+                a_poly = polygons[a_ref]
+                for j in range(i + 1, len(refs_sorted)):
+                    b_ref = refs_sorted[j]
+                    b_poly = polygons[b_ref]
+                    if not a_poly.Collide(b_poly, margin_nm):
+                        continue
+
+                    # Real intersection (of a's margin-expanded polygon vs b) for
+                    # reporting purposes. Can be empty when Collide() matched purely
+                    # on the clearance margin rather than a literal overlap.
+                    a_expanded = pcbnew.SHAPE_POLY_SET(a_poly)
+                    if margin_nm:
+                        a_expanded.Inflate(
+                            margin_nm,
+                            pcbnew.CORNER_STRATEGY_CHAMFER_ALL_CORNERS,
+                            pcbnew.FromMM(0.01),
                         )
+                    inter = pcbnew.SHAPE_POLY_SET()
+                    inter.BooleanIntersection(a_expanded, b_poly)
+
+                    if inter.IsEmpty():
+                        overlap_entry = {
+                            "a": a_ref,
+                            "b": b_ref,
+                            "overlap_x_mm": 0.0,
+                            "overlap_y_mm": 0.0,
+                            "overlap_area_mm2": 0.0,
+                            "bbox": None,
+                            "note": "Within margin but courtyards do not literally touch",
+                        }
+                    else:
+                        ibox = inter.BBox()
+                        overlap_entry = {
+                            "a": a_ref,
+                            "b": b_ref,
+                            "overlap_x_mm": round(self._nm_to_mm(ibox.GetWidth()), 3),
+                            "overlap_y_mm": round(self._nm_to_mm(ibox.GetHeight()), 3),
+                            "overlap_area_mm2": round(inter.Area() / 1e12, 4),
+                            "bbox": {
+                                "x1": round(self._nm_to_mm(ibox.GetLeft()), 3),
+                                "y1": round(self._nm_to_mm(ibox.GetTop()), 3),
+                                "x2": round(self._nm_to_mm(ibox.GetRight()), 3),
+                                "y2": round(self._nm_to_mm(ibox.GetBottom()), 3),
+                                "unit": "mm",
+                            },
+                        }
+                    overlaps.append(overlap_entry)
 
             # Boundary violations
             boundary_violations = []
+            entries_sorted = sorted(entries, key=lambda e: e[0])
             if include_boundary and outline_bbox is not None:
                 ox1, oy1, ox2, oy2 = outline_bbox
                 for ref, bbox in entries_sorted:
@@ -2413,6 +2458,58 @@ class ComponentCommands(PlacementOptimizerCommands):
                 lx1, ly1, lx2, ly2 = self._rotate_aabb(lx1, ly1, lx2, ly2, delta)
 
         return (new_x + lx1, new_y + ly1, new_x + lx2, new_y + ly2)
+
+    @staticmethod
+    def _footprint_courtyard_polygon(fp, override_pos):
+        """Return the footprint's real courtyard shape as a SHAPE_POLY_SET.
+
+        Unlike ``_footprint_courtyard_bbox``, this preserves the actual outline
+        (including cut/chamfered corners on parts like QFPs) instead of collapsing
+        it to a bounding box, so overlap checks don't false-positive on the empty
+        space in a notched corner.
+
+        Falls back to a rectangle built from ``GetBoundingBox()`` when the
+        footprint has no F.Courtyard/B.Courtyard graphics.
+        """
+        poly = None
+        for layer in (pcbnew.F_CrtYd, pcbnew.B_CrtYd):
+            try:
+                ct = fp.GetCourtyard(layer)
+                if ct is not None and ct.OutlineCount() > 0:
+                    poly = pcbnew.SHAPE_POLY_SET(ct)  # clone: we may Move/Rotate it
+                    break
+            except Exception:
+                continue
+        if poly is None:
+            try:
+                box = fp.GetBoundingBox()
+            except Exception:
+                return None
+            poly = pcbnew.SHAPE_POLY_SET()
+            poly.NewOutline()
+            for x, y in (
+                (box.GetLeft(), box.GetTop()),
+                (box.GetRight(), box.GetTop()),
+                (box.GetRight(), box.GetBottom()),
+                (box.GetLeft(), box.GetBottom()),
+            ):
+                poly.Append(x, y)
+
+        if override_pos is None:
+            return poly
+
+        # Re-anchor at the virtual position: rotate about the current anchor by
+        # the requested delta, then translate current anchor -> new position.
+        cur = fp.GetPosition()
+        new_x_nm = int(round(float(override_pos[0]) * 1_000_000.0))
+        new_y_nm = int(round(float(override_pos[1]) * 1_000_000.0))
+        if len(override_pos) == 3:
+            cur_rot = fp.GetOrientationDegrees()
+            delta = float(override_pos[2]) - cur_rot
+            if abs(delta) > 0.01:
+                poly.Rotate(pcbnew.EDA_ANGLE(delta, pcbnew.DEGREES_T), cur)
+        poly.Move(pcbnew.VECTOR2I(new_x_nm - cur.x, new_y_nm - cur.y))
+        return poly
 
     @staticmethod
     def _rotate_aabb(x1, y1, x2, y2, angle_deg):
